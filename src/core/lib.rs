@@ -618,6 +618,21 @@ impl StabilizationManager {
         gyro.smoothed_quaternions = quats;
     }
 
+    /// `recompute_smoothness` with warmup context from an adjacent file (raw quaternions
+    /// remapped onto this file's timeline). See `GyroSource::recompute_smoothness_with_context`.
+    pub fn recompute_smoothness_with_context(&self, warmup_head: &gyro_source::TimeQuat, warmup_tail: &gyro_source::TimeQuat) {
+        let mut params = stabilization::ComputeParams::from_manager(self);
+        params.calculate_camera_fovs();
+
+        let smoothing = self.smoothing.read();
+        let horizon_lock = smoothing.horizon_lock.clone();
+
+        let (quats, max_angles) = self.gyro.read().recompute_smoothness_with_context(smoothing.current().as_ref(), horizon_lock, &params, Some(warmup_head), Some(warmup_tail));
+        let mut gyro = self.gyro.write();
+        gyro.max_angles = max_angles;
+        gyro.smoothed_quaternions = quats;
+    }
+
     pub fn recompute_undistortion(&self) {
         let params = stabilization::ComputeParams::from_manager(self);
         self.stabilization.write().set_compute_params(params);

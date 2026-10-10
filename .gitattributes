@@ -1,0 +1,22 @@
+# 不做任何行尾转换（* -text）。
+#
+# 上游仓库里同时存在 LF 与 CRLF 两种行尾的 blob。如果这里声明 text/eol 转换，git 会把
+# 「需要重新规范化」的文件全部标成已修改（实测 ~250 个），整树 diff 淹没真实改动；而 -text
+# 让 git 原样读写 blob，无论本机 core.autocrlf 是什么，工作区都保持干净。
+* -text
+
+# 二进制资源（显式声明，避免工具误判为文本）
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.ico    binary
+*.icns   binary
+*.gz     binary
+*.zip    binary
+*.ttf    binary
+*.otf    binary
+*.woff   binary
+*.woff2  binary
+*.mp4    binary
+*.qsb    binary
+*.spv    binary

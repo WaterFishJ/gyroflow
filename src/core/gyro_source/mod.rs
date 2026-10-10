@@ -653,9 +653,45 @@ impl GyroSource {
     }
 
     pub fn recompute_smoothness(&self, alg: &dyn SmoothingAlgorithm, horizon_lock: super::smoothing::horizon::HorizonLock, compute_params: &crate::ComputeParams) -> (TimeQuat, (f64, f64, f64)) {
-        let file_metadata = self.file_metadata.read();
-        let mut smoothed_quaternions = self.quaternions.clone();
+        self.recompute_smoothness_with_context(alg, horizon_lock, compute_params, None, None)
+    }
 
+    /// Smoothing pass optionally bracketed by "warmup context" quaternions from an adjacent
+    /// file (`warmup_head` keys must be < body first key, `warmup_tail` keys > body last key).
+    /// The IIR smoothing passes are anchored on the first/last quaternion of whatever sequence
+    /// they receive; for consecutive files of one recording this makes each file's trajectory
+    /// "re-center" at its own edges, visible as a stabilization reset at the seam. Feeding real
+    /// neighboring motion in and discarding it from the result lets the filter arrive at the
+    /// seam already converged, so adjacent files produce a continuous smoothed trajectory.
+    pub fn recompute_smoothness_with_context(&self, alg: &dyn SmoothingAlgorithm, horizon_lock: super::smoothing::horizon::HorizonLock, compute_params: &crate::ComputeParams, warmup_head: Option<&TimeQuat>, warmup_tail: Option<&TimeQuat>) -> (TimeQuat, (f64, f64, f64)) {
+        let file_metadata = self.file_metadata.read();
+
+        let lo = self.quaternions.keys().next().copied().unwrap_or(i64::MIN);
+        let hi = self.quaternions.keys().next_back().copied().unwrap_or(i64::MAX);
+        let body_len = self.quaternions.len();
+
+        // Raw orientation sequence: [head warmup] + this file + [tail warmup]. Warmup entries
+        // are raw quaternions from the adjacent file, already remapped onto this file's local
+        // timeline by the caller (head keys < lo, tail keys > hi).
+        let mut raw = TimeQuat::new();
+        if let Some(head) = warmup_head {
+            for (ts, q) in head {
+                if *ts < lo { raw.insert(*ts, *q); }
+            }
+        }
+        for (ts, q) in &self.quaternions {
+            raw.insert(*ts, *q);
+        }
+        if let Some(tail) = warmup_tail {
+            for (ts, q) in tail {
+                if *ts > hi { raw.insert(*ts, *q); }
+            }
+        }
+
+        // Apply additional rotation (and later horizon lock) to the *whole* sequence so warmup
+        // and body arrive at the smoothing filter with identical transforms; a mismatch would
+        // create a step exactly where the passes cross the seam.
+        let mut smoothed_quaternions = raw.clone();
         for (ts, q) in smoothed_quaternions.iter_mut() {
             use crate::KeyframeType;
             let timestamp_ms = *ts as f64 / 1000.0;
@@ -667,15 +703,28 @@ impl GyroSource {
             *q *= additional_rotation;
         }
 
-        if true {
+        // Algorithms derive the sample rate from len/duration; scale duration by the same
+        // ratio so the effective rate stays what the body alone would produce.
+        let total_len = smoothed_quaternions.len();
+        let duration = self.duration_ms * total_len as f64 / body_len.max(1) as f64;
+
+        let mut smoothed_quaternions = if true {
             // Lock horizon, then smooth
-            horizon_lock.lock(&mut smoothed_quaternions, &self.quaternions, &file_metadata.gravity_vectors, self.use_gravity_vectors, self.integration_method, compute_params);
-            smoothed_quaternions = alg.smooth(&smoothed_quaternions, self.duration_ms, compute_params);
+            horizon_lock.lock(&mut smoothed_quaternions, &raw, &file_metadata.gravity_vectors, self.use_gravity_vectors, self.integration_method, compute_params);
+            let mut s = alg.smooth(&smoothed_quaternions, duration, compute_params);
+            if total_len != body_len {
+                // Drop warmup entries: leaving them would shift `quat_at_timestamp`'s clamping
+                // bounds and make `get_max_angles` see smoothed ts without raw counterparts.
+                s.retain(|ts, _| self.quaternions.contains_key(ts));
+            }
+            s
         } else {
             // Smooth, then lock horizon
-            smoothed_quaternions = alg.smooth(&smoothed_quaternions, self.duration_ms, compute_params);
-            horizon_lock.lock(&mut smoothed_quaternions, &self.quaternions, &file_metadata.gravity_vectors, self.use_gravity_vectors, self.integration_method, compute_params);
-        }
+            let mut s = alg.smooth(&smoothed_quaternions, duration, compute_params);
+            horizon_lock.lock(&mut s, &self.quaternions, &file_metadata.gravity_vectors, self.use_gravity_vectors, self.integration_method, compute_params);
+            s.retain(|ts, _| self.quaternions.contains_key(ts));
+            s
+        };
 
         let max_angles = crate::Smoothing::get_max_angles(&self.quaternions, &smoothed_quaternions, compute_params);
 
